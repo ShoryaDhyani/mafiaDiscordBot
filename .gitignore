@@ -1,0 +1,23 @@
+# Environment
+.env
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Audio cache (generated at runtime)
+audio/*.mp3
