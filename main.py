@@ -359,6 +359,207 @@ async def safe_voice_connect(channel: discord.VoiceChannel, guild: discord.Guild
         return False, None
 
 
+# ==================== HELPER FUNCTIONS ====================
+
+def format_time(seconds: int) -> str:
+    """Format seconds into readable time string"""
+    if seconds >= 60:
+        mins = seconds // 60
+        secs = seconds % 60
+        return f"{mins}m{secs:02d}s" if secs else f"{mins}m"
+    return f"{seconds}s"
+
+
+def create_progress_bar(current: int, total: int, length: int = 8) -> str:
+    """Create a visual progress bar"""
+    filled = int((current / total) * length) if total > 0 else 0
+    return "█" * filled + "░" * (length - filled)
+
+
+# ==================== SETTINGS MODALS ====================
+
+class SettingsModal(ui.Modal, title="⚙️ Time Settings"):
+    """Modal for configuring game time settings"""
+    
+    discussion_time = ui.TextInput(
+        label="Discussion Time (30-600 seconds)",
+        placeholder="300",
+        default="300",
+        min_length=2,
+        max_length=3,
+        required=True
+    )
+    
+    night_time = ui.TextInput(
+        label="Night Action Time (15-120 seconds)",
+        placeholder="45",
+        default="45",
+        min_length=2,
+        max_length=3,
+        required=True
+    )
+    
+    voting_time = ui.TextInput(
+        label="Voting Time (30-300 seconds)",
+        placeholder="60",
+        default="60",
+        min_length=2,
+        max_length=3,
+        required=True
+    )
+    
+    def __init__(self, guild_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+        # Pre-fill with current settings
+        game = get_game(guild_id)
+        if game:
+            self.discussion_time.default = str(game.settings.discussion_time)
+            self.night_time.default = str(game.settings.night_action_time)
+            self.voting_time.default = str(game.settings.voting_time)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        game = get_game(self.guild_id)
+        if not game:
+            await interaction.response.send_message("❌ No active game!", ephemeral=True)
+            return
+        
+        errors = []
+        
+        # Validate discussion time
+        try:
+            disc_time = int(self.discussion_time.value)
+            if 30 <= disc_time <= 600:
+                game.settings.discussion_time = disc_time
+            else:
+                errors.append("Discussion time must be 30-600 seconds")
+        except ValueError:
+            errors.append("Discussion time must be a number")
+        
+        # Validate night time
+        try:
+            night = int(self.night_time.value)
+            if 15 <= night <= 120:
+                game.settings.night_action_time = night
+            else:
+                errors.append("Night time must be 15-120 seconds")
+        except ValueError:
+            errors.append("Night time must be a number")
+        
+        # Validate voting time
+        try:
+            vote = int(self.voting_time.value)
+            if 30 <= vote <= 300:
+                game.settings.voting_time = vote
+            else:
+                errors.append("Voting time must be 30-300 seconds")
+        except ValueError:
+            errors.append("Voting time must be a number")
+        
+        if errors:
+            await interaction.response.send_message("❌ " + "\n".join(errors), ephemeral=True)
+        else:
+            await interaction.response.send_message("✅ Time settings updated!", ephemeral=True)
+            # Update the registration embed
+            if game.registration_message:
+                try:
+                    view = RegistrationView(self.guild_id, game.host_id)
+                    await view.update_registration_embed(game)
+                except:
+                    pass
+
+
+class RoleSettingsModal(ui.Modal, title="👥 Role Settings"):
+    """Modal for configuring role counts"""
+    
+    num_mafia = ui.TextInput(
+        label="Number of Mafia (1-5)",
+        placeholder="1",
+        default="1",
+        min_length=1,
+        max_length=1,
+        required=True
+    )
+    
+    num_doctor = ui.TextInput(
+        label="Number of Doctors (0-3)",
+        placeholder="1",
+        default="1",
+        min_length=1,
+        max_length=1,
+        required=True
+    )
+    
+    num_police = ui.TextInput(
+        label="Number of Police (0-3)",
+        placeholder="1",
+        default="1",
+        min_length=1,
+        max_length=1,
+        required=True
+    )
+    
+    def __init__(self, guild_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+        # Pre-fill with current settings
+        game = get_game(guild_id)
+        if game:
+            self.num_mafia.default = str(game.settings.num_mafia)
+            self.num_doctor.default = str(game.settings.num_doctor)
+            self.num_police.default = str(game.settings.num_police)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        game = get_game(self.guild_id)
+        if not game:
+            await interaction.response.send_message("❌ No active game!", ephemeral=True)
+            return
+        
+        errors = []
+        
+        # Validate mafia count
+        try:
+            mafia = int(self.num_mafia.value)
+            if 1 <= mafia <= 5:
+                game.settings.num_mafia = mafia
+            else:
+                errors.append("Mafia count must be 1-5")
+        except ValueError:
+            errors.append("Mafia count must be a number")
+        
+        # Validate doctor count
+        try:
+            doctor = int(self.num_doctor.value)
+            if 0 <= doctor <= 3:
+                game.settings.num_doctor = doctor
+            else:
+                errors.append("Doctor count must be 0-3")
+        except ValueError:
+            errors.append("Doctor count must be a number")
+        
+        # Validate police count
+        try:
+            police = int(self.num_police.value)
+            if 0 <= police <= 3:
+                game.settings.num_police = police
+            else:
+                errors.append("Police count must be 0-3")
+        except ValueError:
+            errors.append("Police count must be a number")
+        
+        if errors:
+            await interaction.response.send_message("❌ " + "\n".join(errors), ephemeral=True)
+        else:
+            await interaction.response.send_message("✅ Role settings updated!", ephemeral=True)
+            # Update the registration embed
+            if game.registration_message:
+                try:
+                    view = RegistrationView(self.guild_id, game.host_id)
+                    await view.update_registration_embed(game)
+                except:
+                    pass
+
+
 # ==================== REGISTRATION BUTTONS ====================
 
 class RegistrationView(ui.View):
@@ -368,7 +569,7 @@ class RegistrationView(ui.View):
         self.host_id = host_id
     
     async def update_registration_embed(self, game: GameState):
-        """Update the registration message with current player list"""
+        """Update the registration message with current player list and settings"""
         try:
             if game.registration_message:
                 if game.players:
@@ -377,15 +578,26 @@ class RegistrationView(ui.View):
                     player_list = "*No players yet*"
                 
                 min_players = game.settings.num_mafia + game.settings.num_doctor + game.settings.num_police + 1
+                
+                # Build settings display
+                settings_text = (
+                    f"🔪 **Mafia:** {game.settings.num_mafia} | "
+                    f"💉 **Doctor:** {game.settings.num_doctor} | "
+                    f"🔍 **Police:** {game.settings.num_police}\n"
+                    f"💬 **Discussion:** {format_time(game.settings.discussion_time)} | "
+                    f"🌙 **Night:** {format_time(game.settings.night_action_time)} | "
+                    f"🗳️ **Vote:** {format_time(game.settings.voting_time)}"
+                )
+                
                 embed = discord.Embed(
                     title="🌙 Night Has Come - Registration",
-                    description=f"Click the buttons below to join or leave the game!\n\n**Players ({len(game.players)}):**\n{player_list}",
+                    description=f"Click **Join Game** to enter!\n\n**Players ({len(game.players)}):**\n{player_list}",
                     color=discord.Color.purple()
                 )
-                embed.add_field(name="📋 Requirements", value=f"Minimum {min_players} players to start", inline=True)
-                embed.add_field(name="⚙️ Settings", value=f"Mafia: {game.settings.num_mafia} | Doctor: {game.settings.num_doctor} | Police: {game.settings.num_police}", inline=True)
-                embed.set_footer(text="Host can click 'Start Game' when ready")
-                await game.registration_message.edit(embed=embed)
+                embed.add_field(name="📋 Requirements", value=f"Minimum **{min_players}** players", inline=False)
+                embed.add_field(name="⚙️ Current Settings", value=settings_text, inline=False)
+                embed.set_footer(text="Host: Use ⚙️ Settings or 👥 Roles buttons to customize")
+                await game.registration_message.edit(embed=embed, view=self)
         except Exception as e:
             logger.error(f"Failed to update registration embed: {e}")
     
@@ -433,6 +645,52 @@ class RegistrationView(ui.View):
         except Exception as e:
             logger.error(f"Error in leave_button: {e}")
             await interaction.response.send_message("❌ An error occurred. Please try again.", ephemeral=True)
+    
+    @ui.button(label="⚙️ Settings", style=discord.ButtonStyle.secondary, custom_id="game_settings", row=1)
+    async def settings_button(self, interaction: discord.Interaction, button: ui.Button):
+        """Open time settings modal"""
+        try:
+            game = get_game(self.guild_id)
+            if not game or game.phase != GamePhase.REGISTRATION:
+                await interaction.response.send_message("❌ No game in registration!", ephemeral=True)
+                return
+            
+            # Only host or admin can change settings
+            is_host = interaction.user.id == self.host_id
+            is_admin = interaction.user.guild_permissions.administrator
+            
+            if not is_host and not is_admin:
+                await interaction.response.send_message("❌ Only the host or admin can change settings!", ephemeral=True)
+                return
+            
+            modal = SettingsModal(self.guild_id)
+            await interaction.response.send_modal(modal)
+        except Exception as e:
+            logger.error(f"Error in settings_button: {e}")
+            await interaction.response.send_message("❌ An error occurred.", ephemeral=True)
+    
+    @ui.button(label="👥 Roles", style=discord.ButtonStyle.secondary, custom_id="role_settings", row=1)
+    async def roles_button(self, interaction: discord.Interaction, button: ui.Button):
+        """Open role settings modal"""
+        try:
+            game = get_game(self.guild_id)
+            if not game or game.phase != GamePhase.REGISTRATION:
+                await interaction.response.send_message("❌ No game in registration!", ephemeral=True)
+                return
+            
+            # Only host or admin can change settings
+            is_host = interaction.user.id == self.host_id
+            is_admin = interaction.user.guild_permissions.administrator
+            
+            if not is_host and not is_admin:
+                await interaction.response.send_message("❌ Only the host or admin can change role settings!", ephemeral=True)
+                return
+            
+            modal = RoleSettingsModal(self.guild_id)
+            await interaction.response.send_modal(modal)
+        except Exception as e:
+            logger.error(f"Error in roles_button: {e}")
+            await interaction.response.send_message("❌ An error occurred.", ephemeral=True)
     
     @ui.button(label="▶️ Start Game", style=discord.ButtonStyle.primary, custom_id="start_mafia_game", row=1)
     async def start_button(self, interaction: discord.Interaction, button: ui.Button):
@@ -707,21 +965,46 @@ async def assign_roles(game: GameState):
     for i in range(idx, len(player_list)):
         player_list[i].role = Role.CITIZEN
     
-    # DM each player their role
+    # DM each player their role with enhanced formatting
+    role_icons = {
+        Role.CITIZEN: "🧑‍🤝‍🧑",
+        Role.MAFIA: "🔪",
+        Role.DOCTOR: "💉",
+        Role.POLICE: "🔍"
+    }
+    
+    role_tips = {
+        Role.CITIZEN: "💡 **Quick Tips:**\n• Watch for suspicious behavior\n• Note who accuses whom\n• Trust your instincts!",
+        Role.MAFIA: "💡 **Quick Tips:**\n• Blend in with citizens\n• Coordinate with fellow Mafia via DM\n• Create alibis during the day",
+        Role.DOCTOR: "💡 **Quick Tips:**\n• Try to predict Mafia targets\n• Don't reveal your role easily\n• Remember: Can't self-save twice in a row",
+        Role.POLICE: "💡 **Quick Tips:**\n• Investigate suspicious players\n• Be careful revealing findings\n• Share info wisely to avoid being targeted"
+    }
+    
     for player in player_list:
         role_desc = get_role_description(player.role)
+        icon = role_icons.get(player.role, "🎭")
+        tips = role_tips.get(player.role, "")
         
         embed = discord.Embed(
-            title="🎭 Your Role",
-            description=f"You are a **{player.role.value}**!\n\n{role_desc}",
+            title=f"{icon} Your Role: {player.role.value}",
+            description=f"{role_desc}",
             color=get_role_color(player.role)
         )
+        
+        # Add tips
+        if tips:
+            embed.add_field(name="\u200b", value=tips, inline=False)
         
         # If mafia, tell them who other mafias are
         if player.role == Role.MAFIA:
             other_mafia = [p.name for p in player_list if p.role == Role.MAFIA and p.member.id != player.member.id]
             if other_mafia:
-                embed.add_field(name="🔪 Fellow Mafia", value="\n".join(other_mafia), inline=False)
+                embed.add_field(name="🔪 Fellow Mafia", value="\n".join([f"• {name}" for name in other_mafia]), inline=False)
+            else:
+                embed.add_field(name="🔪 Solo Mission", value="You are the only Mafia. Good luck!", inline=False)
+        
+        # Add player count
+        embed.set_footer(text=f"👥 {len(player_list)} players in this game")
         
         try:
             await player.member.send(embed=embed)
@@ -761,26 +1044,31 @@ async def start_night_phase(game: GameState):
     # Play "Night Has Come" announcement
     await play_announcement(game, "night_has_come")
     
-    # Announce night in text
+    # Calculate game stats
+    alive_count = sum(1 for p in game.players.values() if p.is_alive)
+    dead_count = len(game.players) - alive_count
+    
+    # Announce night in text with game status
     embed = discord.Embed(
         title="🌙 Night Has Come",
         description="Everyone go to sleep... Close your eyes.\n\n*The night actions are now taking place in DMs.*",
         color=discord.Color.dark_purple()
     )
-    embed.add_field(name="Round", value=str(game.round_number), inline=True)
+    embed.add_field(name="📊 Game Status", value=f"🔄 Round **{game.round_number}** | 🧑 **{alive_count}** alive | ☠️ **{dead_count}** dead", inline=False)
+    embed.add_field(name="⏱️ Night Duration", value=f"{format_time(game.settings.night_action_time)}", inline=True)
     
     await send_game_message(game, embed=embed)
     
-    # Mute all players during night (works even without bot in voice channel)
-    # Bot just needs "Mute Members" permission
+    # Mute and deafen all alive players during night for full isolation
+    # Bot just needs "Mute Members" and "Deafen Members" permissions
     for player in game.players.values():
         if player.is_alive and hasattr(player.member, 'voice') and player.member.voice:
             try:
-                await player.member.edit(mute=True)
+                await player.member.edit(mute=True, deafen=True)
             except discord.errors.Forbidden:
-                logger.warning(f"No permission to mute {player.name}")
+                logger.warning(f"No permission to mute/deafen {player.name}")
             except Exception as e:
-                logger.warning(f"Failed to mute {player.name}: {e}")
+                logger.warning(f"Failed to mute/deafen {player.name}: {e}")
     
     # Send night action prompts
     timeout = game.settings.night_action_time
@@ -875,15 +1163,19 @@ async def start_day_phase(game: GameState, was_saved: bool):
     # Play "Night Is Over" announcement
     await play_announcement(game, "night_is_over")
     
-    # Unmute all alive players (works even without bot in voice channel)
+    # Unmute and undeafen ONLY alive players (dead stay deafened to not hear discussions)
     for player in game.players.values():
-        if player.is_alive and hasattr(player.member, 'voice') and player.member.voice:
+        if hasattr(player.member, 'voice') and player.member.voice:
             try:
-                await player.member.edit(mute=False)
+                if player.is_alive:
+                    await player.member.edit(mute=False, deafen=False)
+                else:
+                    # Dead players stay muted and deafened
+                    await player.member.edit(mute=True, deafen=True)
             except discord.errors.Forbidden:
-                logger.warning(f"No permission to unmute {player.name}")
+                logger.warning(f"No permission to edit {player.name}")
             except Exception as e:
-                logger.warning(f"Failed to unmute {player.name}: {e}")
+                logger.warning(f"Failed to edit {player.name}: {e}")
     
     # Play saved announcement if someone was saved
     if was_saved:
@@ -924,9 +1216,25 @@ async def start_day_phase(game: GameState, was_saved: bool):
     if await check_win_condition(game):
         return
     
-    # Discussion time
-    await send_game_message(game, content=f"💬 **Discussion time!** You have {game.settings.discussion_time} seconds to discuss.")
-    await asyncio.sleep(game.settings.discussion_time)
+    # Discussion time with countdown updates
+    discussion_time = game.settings.discussion_time
+    await send_game_message(game, content=f"💬 **Discussion time!** You have **{format_time(discussion_time)}** to discuss.")
+    
+    # Countdown updates at specific intervals
+    countdown_points = [60, 30, 10, 5]
+    elapsed = 0
+    
+    for countdown in countdown_points:
+        if discussion_time > countdown:
+            wait_until = discussion_time - countdown
+            if wait_until > elapsed:
+                await asyncio.sleep(wait_until - elapsed)
+                elapsed = wait_until
+                await send_game_message(game, content=f"⏱️ **{countdown} seconds** remaining for discussion!")
+    
+    # Wait remaining time
+    if discussion_time > elapsed:
+        await asyncio.sleep(discussion_time - elapsed)
     
     # Start voting
     await start_voting_phase(game)
@@ -991,21 +1299,25 @@ async def process_voting_results(game: GameState):
         vote = game.day_votes.get(player.member.id, None)  # Default to skip if no vote
         vote_counts[vote] = vote_counts.get(vote, 0) + 1
     
-    # Display vote results
+    # Display vote results with visual bars
     embed = discord.Embed(
         title="📊 Voting Results",
         color=discord.Color.blue()
     )
     
+    # Find max votes for scaling bars
+    max_vote_count = max(vote_counts.values()) if vote_counts else 1
+    
     results = []
     for target_id, count in sorted(vote_counts.items(), key=lambda x: x[1], reverse=True):
+        bar = create_progress_bar(count, max_vote_count, 10)
         if target_id is None:
-            results.append(f"⏭️ Skip: **{count}** votes")
+            results.append(f"⏭️ Skip {bar} **{count}**")
         else:
             target_name = game.players[target_id].name
-            results.append(f"👤 {target_name}: **{count}** votes")
+            results.append(f"👤 {target_name} {bar} **{count}**")
     
-    embed.description = "\n".join(results)
+    embed.description = "\n".join(results) if results else "No votes cast"
     
     # Find the highest voted (excluding skips for elimination)
     non_skip_votes = {k: v for k, v in vote_counts.items() if k is not None}
@@ -1091,15 +1403,15 @@ async def end_game(game: GameState, embed: discord.Embed):
         
         final_message = await game.text_channel.send(embed=embed)
         
-        # Unmute all players (works even without bot in voice channel)
+        # Unmute and undeafen all players at game end
         for player in game.players.values():
             if hasattr(player.member, 'voice') and player.member.voice:
                 try:
-                    await player.member.edit(mute=False)
+                    await player.member.edit(mute=False, deafen=False)
                 except discord.errors.Forbidden:
-                    logger.warning(f"No permission to unmute {player.name}")
+                    logger.warning(f"No permission to unmute/undeafen {player.name}")
                 except Exception as e:
-                    logger.warning(f"Failed to unmute {player.name}: {e}")
+                    logger.warning(f"Failed to unmute/undeafen {player.name}: {e}")
         
         # Disconnect from voice if connected
         if game.guild:
