@@ -31,20 +31,20 @@ logging.basicConfig(
 logger = logging.getLogger('MafiaBot')
 
 # Text-to-speech for announcements
-try:
-    from gtts import gTTS
-    TTS_AVAILABLE = True
-except ImportError:
-    TTS_AVAILABLE = False
-    print("Warning: gTTS not installed. Audio announcements disabled. Run: pip install gTTS")
+# try:
+#     from gtts import gTTS
+#     TTS_AVAILABLE = True
+# except ImportError:
+#     TTS_AVAILABLE = False
+#     print("Warning: gTTS not installed. Audio announcements disabled. Run: pip install gTTS")
 
 # Load environment variables
 load_dotenv()
 TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 
 # Audio folder setup
-AUDIO_FOLDER = Path(__file__).parent / "audio"
-AUDIO_FOLDER.mkdir(exist_ok=True)
+# AUDIO_FOLDER = Path(__file__).parent / "audio"
+# AUDIO_FOLDER.mkdir(exist_ok=True)
 
 # Bot setup with intents
 intents = discord.Intents.default()
@@ -89,8 +89,9 @@ class GameSettings:
     num_police: int = 1
     voting_time: int = 60  # seconds
     discussion_time: int = 300  # seconds
-    night_action_time: int = 45  # seconds
     registration_time: int = 90  # seconds
+    mafia_skip_kills: int = 1  # How many times mafia can skip killing per game
+    role_reveal_mode: int = 3  # 1=no reveal, 2=mafia or not, 3=full role + suspense
     test_mode: bool = False  # Testing mode flag
 
 
@@ -130,6 +131,13 @@ class GameState:
     mafia_target: Optional[int] = None
     doctor_save: Optional[int] = None
     police_investigation: Optional[int] = None
+    night_actions_expected: int = 0  # Total night actions expected
+    night_actions_received: int = 0  # Total night actions received
+    night_auto_end_triggered: bool = False  # Prevent double-triggering
+    night_actions_submitted: set = field(default_factory=set)  # Player IDs who already submitted
+    
+    # Mafia skip tracking
+    mafia_skips_used: int = 0  # How many times mafia has skipped killing
     
     # Day voting
     day_votes: Dict[int, Optional[int]] = field(default_factory=dict)  # voter_id -> target_id (None = skip)
@@ -239,8 +247,7 @@ async def generate_tts_audio(text: str, filename: str) -> Optional[Path]:
 
 async def play_announcement(game: GameState, announcement_key: str):
     """Play an announcement in the voice channel"""
-    if not game.voice_connected or not game.guild:
-        return
+    return  # Voice feedback disabled for now
     
     voice_client = game.guild.voice_client
     if not voice_client or not voice_client.is_connected():
@@ -378,22 +385,13 @@ def create_progress_bar(current: int, total: int, length: int = 8) -> str:
 
 # ==================== SETTINGS MODALS ====================
 
-class SettingsModal(ui.Modal, title="⚙️ Time Settings"):
+class SettingsModal(ui.Modal, title="⚙️ Game Settings"):
     """Modal for configuring game time settings"""
     
     discussion_time = ui.TextInput(
         label="Discussion Time (30-600 seconds)",
         placeholder="300",
         default="300",
-        min_length=2,
-        max_length=3,
-        required=True
-    )
-    
-    night_time = ui.TextInput(
-        label="Night Action Time (15-120 seconds)",
-        placeholder="45",
-        default="45",
         min_length=2,
         max_length=3,
         required=True
@@ -411,11 +409,9 @@ class SettingsModal(ui.Modal, title="⚙️ Time Settings"):
     def __init__(self, guild_id: int):
         super().__init__()
         self.guild_id = guild_id
-        # Pre-fill with current settings
         game = get_game(guild_id)
         if game:
             self.discussion_time.default = str(game.settings.discussion_time)
-            self.night_time.default = str(game.settings.night_action_time)
             self.voting_time.default = str(game.settings.voting_time)
     
     async def on_submit(self, interaction: discord.Interaction):
@@ -426,7 +422,6 @@ class SettingsModal(ui.Modal, title="⚙️ Time Settings"):
         
         errors = []
         
-        # Validate discussion time
         try:
             disc_time = int(self.discussion_time.value)
             if 30 <= disc_time <= 600:
@@ -436,17 +431,6 @@ class SettingsModal(ui.Modal, title="⚙️ Time Settings"):
         except ValueError:
             errors.append("Discussion time must be a number")
         
-        # Validate night time
-        try:
-            night = int(self.night_time.value)
-            if 15 <= night <= 120:
-                game.settings.night_action_time = night
-            else:
-                errors.append("Night time must be 15-120 seconds")
-        except ValueError:
-            errors.append("Night time must be a number")
-        
-        # Validate voting time
         try:
             vote = int(self.voting_time.value)
             if 30 <= vote <= 300:
@@ -459,14 +443,68 @@ class SettingsModal(ui.Modal, title="⚙️ Time Settings"):
         if errors:
             await interaction.response.send_message("❌ " + "\n".join(errors), ephemeral=True)
         else:
-            await interaction.response.send_message("✅ Time settings updated!", ephemeral=True)
-            # Update the registration embed
+            await interaction.response.send_message("✅ Settings updated!", ephemeral=True)
             if game.registration_message:
                 try:
                     view = RegistrationView(self.guild_id, game.host_id)
                     await view.update_registration_embed(game)
                 except:
                     pass
+
+
+class RevealModeSelect(ui.Select):
+    """Dropdown for selecting role reveal mode"""
+    def __init__(self, guild_id: int, current_mode: int):
+        self.guild_id = guild_id
+        options = [
+            discord.SelectOption(
+                label="Hidden", value="1",
+                description="Just say 'voted out' — no role info",
+                emoji="🚫",
+                default=(current_mode == 1)
+            ),
+            discord.SelectOption(
+                label="Mafia or Not", value="2",
+                description="Reveal if they were Mafia or not",
+                emoji="❓",
+                default=(current_mode == 2)
+            ),
+            discord.SelectOption(
+                label="Full Role + Suspense", value="3",
+                description="Dramatic reveal with exact role",
+                emoji="🎭",
+                default=(current_mode == 3)
+            ),
+        ]
+        super().__init__(placeholder="Select reveal mode...", options=options, min_values=1, max_values=1)
+    
+    async def callback(self, interaction: discord.Interaction):
+        game = get_game(self.guild_id)
+        if not game:
+            await interaction.response.send_message("❌ No active game!", ephemeral=True)
+            return
+        
+        mode = int(self.values[0])
+        game.settings.role_reveal_mode = mode
+        labels = {1: "Hidden", 2: "Mafia or Not", 3: "Full Role + Suspense"}
+        
+        self.disabled = True
+        self.placeholder = f"✅ {labels[mode]}"
+        await interaction.response.edit_message(view=self.view)
+        
+        # Update registration embed
+        if game.registration_message:
+            try:
+                reg_view = RegistrationView(self.guild_id, game.host_id)
+                await reg_view.update_registration_embed(game)
+            except:
+                pass
+
+
+class RevealModeView(ui.View):
+    def __init__(self, guild_id: int, current_mode: int):
+        super().__init__(timeout=30)
+        self.add_item(RevealModeSelect(guild_id, current_mode))
 
 
 class RoleSettingsModal(ui.Modal, title="👥 Role Settings"):
@@ -580,13 +618,14 @@ class RegistrationView(ui.View):
                 min_players = game.settings.num_mafia + game.settings.num_doctor + game.settings.num_police + 1
                 
                 # Build settings display
+                reveal_labels = {1: "Hidden", 2: "Mafia/Not", 3: "Full Role"}
                 settings_text = (
                     f"🔪 **Mafia:** {game.settings.num_mafia} | "
                     f"💉 **Doctor:** {game.settings.num_doctor} | "
                     f"🔍 **Police:** {game.settings.num_police}\n"
                     f"💬 **Discussion:** {format_time(game.settings.discussion_time)} | "
-                    f"🌙 **Night:** {format_time(game.settings.night_action_time)} | "
-                    f"🗳️ **Vote:** {format_time(game.settings.voting_time)}"
+                    f"🗳️ **Vote:** {format_time(game.settings.voting_time)} | "
+                    f"👁️ **Reveal:** {reveal_labels.get(game.settings.role_reveal_mode, 'Full Role')}"
                 )
                 
                 embed = discord.Embed(
@@ -601,7 +640,7 @@ class RegistrationView(ui.View):
         except Exception as e:
             logger.error(f"Failed to update registration embed: {e}")
     
-    @ui.button(label="🎮 Join Game", style=discord.ButtonStyle.green, custom_id="join_mafia_game", row=0)
+    @ui.button(label="Join", style=discord.ButtonStyle.green, custom_id="join_mafia_game", row=0)
     async def join_button(self, interaction: discord.Interaction, button: ui.Button):
         try:
             game = get_game(self.guild_id)
@@ -623,7 +662,7 @@ class RegistrationView(ui.View):
             logger.error(f"Error in join_button: {e}")
             await interaction.response.send_message("❌ An error occurred. Please try again.", ephemeral=True)
     
-    @ui.button(label="🚪 Leave Game", style=discord.ButtonStyle.danger, custom_id="leave_mafia_game", row=0)
+    @ui.button(label="Leave", style=discord.ButtonStyle.danger, custom_id="leave_mafia_game", row=0)
     async def leave_button(self, interaction: discord.Interaction, button: ui.Button):
         try:
             game = get_game(self.guild_id)
@@ -646,7 +685,7 @@ class RegistrationView(ui.View):
             logger.error(f"Error in leave_button: {e}")
             await interaction.response.send_message("❌ An error occurred. Please try again.", ephemeral=True)
     
-    @ui.button(label="⚙️ Settings", style=discord.ButtonStyle.secondary, custom_id="game_settings", row=1)
+    @ui.button(label="Settings", style=discord.ButtonStyle.secondary, custom_id="game_settings", row=1)
     async def settings_button(self, interaction: discord.Interaction, button: ui.Button):
         """Open time settings modal"""
         try:
@@ -669,7 +708,7 @@ class RegistrationView(ui.View):
             logger.error(f"Error in settings_button: {e}")
             await interaction.response.send_message("❌ An error occurred.", ephemeral=True)
     
-    @ui.button(label="👥 Roles", style=discord.ButtonStyle.secondary, custom_id="role_settings", row=1)
+    @ui.button(label="Roles", style=discord.ButtonStyle.secondary, custom_id="role_settings", row=1)
     async def roles_button(self, interaction: discord.Interaction, button: ui.Button):
         """Open role settings modal"""
         try:
@@ -678,7 +717,6 @@ class RegistrationView(ui.View):
                 await interaction.response.send_message("❌ No game in registration!", ephemeral=True)
                 return
             
-            # Only host or admin can change settings
             is_host = interaction.user.id == self.host_id
             is_admin = interaction.user.guild_permissions.administrator
             
@@ -692,7 +730,29 @@ class RegistrationView(ui.View):
             logger.error(f"Error in roles_button: {e}")
             await interaction.response.send_message("❌ An error occurred.", ephemeral=True)
     
-    @ui.button(label="▶️ Start Game", style=discord.ButtonStyle.primary, custom_id="start_mafia_game", row=1)
+    @ui.button(label="Reveal", style=discord.ButtonStyle.secondary, custom_id="reveal_settings", row=1)
+    async def reveal_button(self, interaction: discord.Interaction, button: ui.Button):
+        """Open reveal mode dropdown"""
+        try:
+            game = get_game(self.guild_id)
+            if not game or game.phase != GamePhase.REGISTRATION:
+                await interaction.response.send_message("❌ No game in registration!", ephemeral=True)
+                return
+            
+            is_host = interaction.user.id == self.host_id
+            is_admin = interaction.user.guild_permissions.administrator
+            
+            if not is_host and not is_admin:
+                await interaction.response.send_message("❌ Only the host or admin can change this!", ephemeral=True)
+                return
+            
+            view = RevealModeView(self.guild_id, game.settings.role_reveal_mode)
+            await interaction.response.send_message("👁️ **Choose what to reveal when a player is voted out:**", view=view, ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error in reveal_button: {e}")
+            await interaction.response.send_message("❌ An error occurred.", ephemeral=True)
+    
+    @ui.button(label="Start", style=discord.ButtonStyle.primary, custom_id="start_mafia_game", row=0)
     async def start_button(self, interaction: discord.Interaction, button: ui.Button):
         try:
             game = get_game(self.guild_id)
@@ -732,6 +792,50 @@ class RegistrationView(ui.View):
         except Exception as e:
             logger.error(f"Error in start_button: {e}")
             await interaction.response.send_message("❌ An error occurred while starting the game.", ephemeral=True)
+    
+    @ui.button(label="Exit", style=discord.ButtonStyle.danger, custom_id="end_mafia_game", row=2)
+    async def end_button(self, interaction: discord.Interaction, button: ui.Button):
+        try:
+            game = get_game(self.guild_id)
+            if not game:
+                await interaction.response.send_message("No active game!", ephemeral=True)
+                return
+            
+            # Only host or admin can end
+            is_host = interaction.user.id == self.host_id
+            is_admin = interaction.user.guild_permissions.administrator
+            
+            if not is_host and not is_admin:
+                await interaction.response.send_message("❌ Only the host or an admin can end the game!", ephemeral=True)
+                return
+            
+            game.phase = GamePhase.ENDED
+            
+            # Disable all buttons
+            for item in self.children:
+                item.disabled = True
+            if game.registration_message:
+                await game.registration_message.edit(view=self)
+            
+            await interaction.response.send_message("🛑 **Game has been ended by the host.**")
+            
+            # Unmute all players
+            for player in game.players.values():
+                if hasattr(player.member, 'voice') and player.member.voice:
+                    try:
+                        await player.member.edit(mute=False)
+                    except:
+                        pass
+            
+            # Clean up
+            await delete_game_messages(game)
+            if self.guild_id in active_games:
+                del active_games[self.guild_id]
+            
+            logger.info(f"Game ended by {interaction.user.display_name} in guild {self.guild_id}")
+        except Exception as e:
+            logger.error(f"Error in end_button: {e}")
+            await interaction.response.send_message("❌ An error occurred.", ephemeral=True)
 
 
 # Legacy alias for backwards compatibility
@@ -825,27 +929,64 @@ class MafiaTargetSelect(ui.Select):
             if p.is_alive and p.role != Role.MAFIA
         ]
         
+        # Add skip option if mafia has skips remaining
+        skips_remaining = game.settings.mafia_skip_kills - game.mafia_skips_used
+        if skips_remaining > 0:
+            options.append(discord.SelectOption(
+                label=f"⏭️ Skip Kill ({skips_remaining} left)",
+                value="skip_kill",
+                description="No one dies tonight"
+            ))
+        
         super().__init__(placeholder="Select target to eliminate...", options=options)
     
     async def callback(self, interaction: discord.Interaction):
-        target_id = int(self.values[0])
-        self.game.mafia_votes[self.mafia_player.member.id] = target_id
-        target_name = self.game.players[target_id].name
+        player_id = self.mafia_player.member.id
+        already_submitted = player_id in self.game.night_actions_submitted
         
-        await interaction.response.send_message(f"🔪 You voted to eliminate **{target_name}**", ephemeral=True)
+        if already_submitted:
+            await interaction.response.send_message("❌ You have already made your choice this round!", ephemeral=True)
+            return
         
-        # Relay to other mafia members
-        for player in self.game.players.values():
-            if player.role == Role.MAFIA and player.member.id != self.mafia_player.member.id and player.is_alive:
-                try:
-                    await player.member.send(f"🔪 **{self.mafia_player.name}** voted to eliminate **{target_name}**")
-                except:
-                    pass
+        selected = self.values[0]
+        
+        if selected == "skip_kill":
+            self.game.mafia_votes[player_id] = -1
+            await interaction.response.send_message("⏭️ You voted to **skip the kill** tonight.", ephemeral=True)
+            
+            for player in self.game.players.values():
+                if player.role == Role.MAFIA and player.member.id != player_id and player.is_alive:
+                    try:
+                        await player.member.send(f"⏭️ **{self.mafia_player.name}** voted to **skip the kill** tonight.")
+                    except:
+                        pass
+        else:
+            target_id = int(selected)
+            self.game.mafia_votes[player_id] = target_id
+            target_name = self.game.players[target_id].name
+            
+            await interaction.response.send_message(f"🔪 You voted to eliminate **{target_name}**", ephemeral=True)
+            
+            for player in self.game.players.values():
+                if player.role == Role.MAFIA and player.member.id != player_id and player.is_alive:
+                    try:
+                        await player.member.send(f"🔪 **{self.mafia_player.name}** voted to eliminate **{target_name}**")
+                    except:
+                        pass
+        
+        # Track night action (only once per player)
+        self.game.night_actions_submitted.add(player_id)
+        self.game.night_actions_received += 1
+        
+        # Disable the select after use
+        self.disabled = True
+        self.placeholder = "✅ Choice submitted"
+        await interaction.edit_original_response(view=self.view)
 
 
 class MafiaTargetView(ui.View):
-    def __init__(self, game: GameState, mafia_player: Player, timeout: int):
-        super().__init__(timeout=timeout)
+    def __init__(self, game: GameState, mafia_player: Player):
+        super().__init__(timeout=None)
         self.add_item(MafiaTargetSelect(game, mafia_player))
 
 
@@ -867,8 +1008,19 @@ class DoctorSaveSelect(ui.Select):
         super().__init__(placeholder="Select who to save...", options=options if options else [discord.SelectOption(label="No one", value="none")])
     
     async def callback(self, interaction: discord.Interaction):
+        player_id = self.doctor_player.member.id
+        
+        if player_id in self.game.night_actions_submitted:
+            await interaction.response.send_message("❌ You have already made your choice this round!", ephemeral=True)
+            return
+        
         if self.values[0] == "none":
             await interaction.response.send_message("💉 There's no one you can save this round.", ephemeral=True)
+            self.game.night_actions_submitted.add(player_id)
+            self.game.night_actions_received += 1
+            self.disabled = True
+            self.placeholder = "✅ Choice submitted"
+            await interaction.edit_original_response(view=self.view)
             return
         
         target_id = int(self.values[0])
@@ -882,11 +1034,20 @@ class DoctorSaveSelect(ui.Select):
             self.doctor_player.doctor_self_save_used = False
         
         await interaction.response.send_message(f"💉 You chose to save **{target_name}**", ephemeral=True)
+        
+        # Track night action (only once per player)
+        self.game.night_actions_submitted.add(player_id)
+        self.game.night_actions_received += 1
+        
+        # Disable the select after use
+        self.disabled = True
+        self.placeholder = "✅ Choice submitted"
+        await interaction.edit_original_response(view=self.view)
 
 
 class DoctorSaveView(ui.View):
-    def __init__(self, game: GameState, doctor_player: Player, timeout: int):
-        super().__init__(timeout=timeout)
+    def __init__(self, game: GameState, doctor_player: Player):
+        super().__init__(timeout=None)
         self.add_item(DoctorSaveSelect(game, doctor_player))
 
 
@@ -906,6 +1067,13 @@ class PoliceInvestigateSelect(ui.Select):
         super().__init__(placeholder="Select who to investigate...", options=options)
     
     async def callback(self, interaction: discord.Interaction):
+        player_id = self.police_player.member.id
+        
+        # Police can only investigate ONCE per round - no changing!
+        if player_id in self.game.night_actions_submitted:
+            await interaction.response.send_message("❌ You have already investigated someone this round!", ephemeral=True)
+            return
+        
         target_id = int(self.values[0])
         self.game.police_investigation = target_id
         target = self.game.players[target_id]
@@ -914,12 +1082,140 @@ class PoliceInvestigateSelect(ui.Select):
         result = "🔴 **IS MAFIA!**" if is_mafia else "🟢 **NOT Mafia**"
         
         await interaction.response.send_message(f"🔍 Investigation result for **{target.name}**: {result}", ephemeral=True)
+        
+        # Track night action (only once per player)
+        self.game.night_actions_submitted.add(player_id)
+        self.game.night_actions_received += 1
+        
+        # Disable the select after use
+        self.disabled = True
+        self.placeholder = "✅ Investigation complete"
+        await interaction.edit_original_response(view=self.view)
 
 
 class PoliceInvestigateView(ui.View):
-    def __init__(self, game: GameState, police_player: Player, timeout: int):
-        super().__init__(timeout=timeout)
+    def __init__(self, game: GameState, police_player: Player):
+        super().__init__(timeout=None)
         self.add_item(PoliceInvestigateSelect(game, police_player))
+
+
+# ==================== PHASE CONTROL BUTTONS ====================
+
+class NightEndView(ui.View):
+    """Button for host/admin to end the night phase and proceed to day"""
+    def __init__(self, game: GameState, host_id: int):
+        super().__init__(timeout=None)
+        self.game = game
+        self.host_id = host_id
+    
+    @ui.button(label="☀️ End Night", style=discord.ButtonStyle.primary, custom_id="end_night_phase")
+    async def end_night_button(self, interaction: discord.Interaction, button: ui.Button):
+        try:
+            # Only host or admin can click
+            is_host = interaction.user.id == self.host_id
+            is_admin = interaction.user.guild_permissions.administrator
+            
+            if not is_host and not is_admin:
+                await interaction.response.send_message("❌ Only the host or admin can end the night!", ephemeral=True)
+                return
+            
+            if self.game.phase != GamePhase.NIGHT:
+                await interaction.response.send_message("❌ It's not night time!", ephemeral=True)
+                return
+            
+            # Disable the button
+            button.disabled = True
+            button.label = "☀️ Night Ended"
+            await interaction.response.edit_message(view=self)
+            
+            logger.info(f"Night ended manually by {interaction.user.display_name}")
+            
+            # Process night results
+            await process_night_results(self.game)
+        except Exception as e:
+            logger.error(f"Error in end_night_button: {e}")
+            try:
+                await interaction.response.send_message("❌ An error occurred.", ephemeral=True)
+            except:
+                pass
+
+
+class DiscussionEndView(ui.View):
+    """Button for host/admin to end discussion and start voting"""
+    def __init__(self, game: GameState, host_id: int):
+        super().__init__(timeout=None)
+        self.game = game
+        self.host_id = host_id
+    
+    @ui.button(label="🗳️ Start Voting", style=discord.ButtonStyle.danger, custom_id="start_voting_phase")
+    async def start_voting_button(self, interaction: discord.Interaction, button: ui.Button):
+        try:
+            # Only host or admin can click
+            is_host = interaction.user.id == self.host_id
+            is_admin = interaction.user.guild_permissions.administrator
+            
+            if not is_host and not is_admin:
+                await interaction.response.send_message("❌ Only the host or admin can start voting!", ephemeral=True)
+                return
+            
+            if self.game.phase != GamePhase.DAY:
+                await interaction.response.send_message("❌ It's not discussion time!", ephemeral=True)
+                return
+            
+            # Disable the button
+            button.disabled = True
+            button.label = "🗳️ Voting Started"
+            await interaction.response.edit_message(view=self)
+            
+            logger.info(f"Voting started manually by {interaction.user.display_name}")
+            
+            # Start voting phase
+            await start_voting_phase(self.game)
+        except Exception as e:
+            logger.error(f"Error in start_voting_button: {e}")
+            try:
+                await interaction.response.send_message("❌ An error occurred.", ephemeral=True)
+            except:
+                pass
+
+
+class NextRoundView(ui.View):
+    """Button for host/admin to start the next night round"""
+    def __init__(self, game: GameState, host_id: int):
+        super().__init__(timeout=None)
+        self.game = game
+        self.host_id = host_id
+    
+    @ui.button(label="🌙 Start Night", style=discord.ButtonStyle.primary, custom_id="start_next_night")
+    async def start_night_button(self, interaction: discord.Interaction, button: ui.Button):
+        try:
+            # Only host or admin can click
+            is_host = interaction.user.id == self.host_id
+            is_admin = interaction.user.guild_permissions.administrator
+            
+            if not is_host and not is_admin:
+                await interaction.response.send_message("❌ Only the host or admin can start the next round!", ephemeral=True)
+                return
+            
+            if self.game.phase == GamePhase.ENDED:
+                await interaction.response.send_message("❌ The game has ended!", ephemeral=True)
+                return
+            
+            # Disable the button
+            button.disabled = True
+            button.label = "🌙 Night Starting..."
+            await interaction.response.edit_message(view=self)
+            
+            logger.info(f"Next night started manually by {interaction.user.display_name}")
+            
+            # Start next night
+            await start_night_phase(self.game)
+        except Exception as e:
+            logger.error(f"Error in start_night_button: {e}")
+            try:
+                await interaction.response.send_message("❌ An error occurred.", ephemeral=True)
+            except:
+                pass
 
 
 # ==================== MAFIA CHAT RELAY ====================
@@ -1032,14 +1328,48 @@ def get_role_color(role: Role) -> discord.Color:
     return colors.get(role, discord.Color.light_grey())
 
 
+async def check_all_night_actions_done(game: GameState):
+    """Check if all night actions have been submitted, auto-end night after 10s delay"""
+    if game.phase != GamePhase.NIGHT or game.night_auto_end_triggered:
+        return
+    
+    if game.night_actions_received >= game.night_actions_expected:
+        game.night_auto_end_triggered = True
+        
+        # Fire off the delayed processing as a background task
+        # so the interaction callback returns immediately
+        async def _delayed_night_end():
+            try:
+                if game.settings.test_mode:
+                    await send_game_message(game, content=f"🤖 *(Test Mode) All {game.night_actions_received}/{game.night_actions_expected} night actions received*")
+                
+                await send_game_message(game, content="✅ **All night actions are in!** Processing results in 10 seconds...")
+                await asyncio.sleep(10)
+                
+                # Check if game was force stopped during wait
+                if game.phase == GamePhase.ENDED:
+                    return
+                
+                await process_night_results(game)
+            except Exception as e:
+                logger.error(f"Error in delayed night end: {e}", exc_info=True)
+        
+        asyncio.create_task(_delayed_night_end())
+
+
 async def start_night_phase(game: GameState):
     """Start the night phase"""
+    # Check if game was force stopped
+    if game.phase == GamePhase.ENDED:
+        return
+    
     game.phase = GamePhase.NIGHT
     game.round_number += 1
     game.mafia_votes.clear()
     game.mafia_target = None
     game.doctor_save = None
     game.police_investigation = None
+    game.night_actions_submitted.clear()
     
     # Play "Night Has Come" announcement
     await play_announcement(game, "night_has_come")
@@ -1055,29 +1385,42 @@ async def start_night_phase(game: GameState):
         color=discord.Color.dark_purple()
     )
     embed.add_field(name="📊 Game Status", value=f"🔄 Round **{game.round_number}** | 🧑 **{alive_count}** alive | ☠️ **{dead_count}** dead", inline=False)
-    embed.add_field(name="⏱️ Night Duration", value=f"{format_time(game.settings.night_action_time)}", inline=True)
+    embed.add_field(name="⏳ Waiting", value="Night ends automatically after all roles submit their actions.", inline=True)
     
     await send_game_message(game, embed=embed)
     
-    # Mute and deafen all alive players during night for full isolation
-    # Bot just needs "Mute Members" and "Deafen Members" permissions
+    # Reset night action tracking
+    game.night_actions_received = 0
+    game.night_auto_end_triggered = False
+    
+    # Calculate expected night actions
+    alive_mafia = [p for p in game.players.values() if p.role == Role.MAFIA and p.is_alive]
+    alive_doctors = [p for p in game.players.values() if p.role == Role.DOCTOR and p.is_alive]
+    alive_police = [p for p in game.players.values() if p.role == Role.POLICE and p.is_alive]
+    
+    # Count expected actions (only from real players, not bots in test mode)
+    if game.settings.test_mode:
+        real_mafia = [p for p in alive_mafia if not isinstance(p.member, DummyMember)]
+        real_doctors = [p for p in alive_doctors if not isinstance(p.member, DummyMember)]
+        real_police = [p for p in alive_police if not isinstance(p.member, DummyMember)]
+        game.night_actions_expected = len(real_mafia) + len(real_doctors) + len(real_police)
+    else:
+        game.night_actions_expected = len(alive_mafia) + len(alive_doctors) + len(alive_police)
+    
+    # Mute all alive players during night
     for player in game.players.values():
         if player.is_alive and hasattr(player.member, 'voice') and player.member.voice:
             try:
-                await player.member.edit(mute=True, deafen=True)
+                await player.member.edit(mute=True)
             except discord.errors.Forbidden:
-                logger.warning(f"No permission to mute/deafen {player.name}")
+                logger.warning(f"No permission to mute {player.name}")
             except Exception as e:
-                logger.warning(f"Failed to mute/deafen {player.name}: {e}")
-    
-    # Send night action prompts
-    timeout = game.settings.night_action_time
+                logger.warning(f"Failed to mute {player.name}: {e}")
     
     # Mafia selection
-    alive_mafia = [p for p in game.players.values() if p.role == Role.MAFIA and p.is_alive]
     for mafia in alive_mafia:
         try:
-            view = MafiaTargetView(game, mafia, timeout)
+            view = MafiaTargetView(game, mafia)
             embed = discord.Embed(
                 title="🔪 Mafia Night Action",
                 description="Choose your target to eliminate.\n\nYou can also type messages here to communicate with other Mafia members.",
@@ -1091,21 +1434,19 @@ async def start_night_phase(game: GameState):
     if game.settings.test_mode:
         bot_mafia = [p for p in alive_mafia if isinstance(p.member, DummyMember)]
         if bot_mafia:
-            # Get possible targets (alive non-mafia players)
             possible_targets = [p for p in game.players.values() 
                               if p.is_alive and p.role != Role.MAFIA]
             if possible_targets:
                 target = random.choice(possible_targets)
-                # Set all bot mafia votes to this target
                 for mafia in bot_mafia:
                     game.mafia_votes[mafia.member.id] = target.member.id
-                await send_game_message(game, content=f"🤖 *[Test Mode] Bot Mafia auto-targeted **{target.name}***")
+                    game.night_actions_received += 1
+                await send_game_message(game, content=f"🤖 *(Test Mode) Bot Mafia auto-targeted **{target.name}***")
     
     # Doctor selection
-    alive_doctors = [p for p in game.players.values() if p.role == Role.DOCTOR and p.is_alive]
     for doctor in alive_doctors:
         try:
-            view = DoctorSaveView(game, doctor, timeout)
+            view = DoctorSaveView(game, doctor)
             embed = discord.Embed(
                 title="💉 Doctor Night Action",
                 description="Choose who to save tonight.",
@@ -1118,10 +1459,9 @@ async def start_night_phase(game: GameState):
             pass
     
     # Police investigation
-    alive_police = [p for p in game.players.values() if p.role == Role.POLICE and p.is_alive]
     for police in alive_police:
         try:
-            view = PoliceInvestigateView(game, police, timeout)
+            view = PoliceInvestigateView(game, police)
             embed = discord.Embed(
                 title="🔍 Police Night Action",
                 description="Choose who to investigate tonight.",
@@ -1131,15 +1471,75 @@ async def start_night_phase(game: GameState):
         except:
             pass
     
-    # Wait for night actions
-    await asyncio.sleep(timeout + 5)
+    # In test mode, auto-act for bot doctors and police
+    if game.settings.test_mode:
+        bot_doctors = [p for p in alive_doctors if isinstance(p.member, DummyMember)]
+        for doctor in bot_doctors:
+            possible_saves = [p for p in game.players.values() if p.is_alive]
+            if possible_saves:
+                save_target = random.choice(possible_saves)
+                game.doctor_save = save_target.member.id
+                game.night_actions_received += 1
+                await send_game_message(game, content=f"🤖 *(Test Mode) Bot Doctor auto-saved **{save_target.name}***")
+        
+        bot_police = [p for p in alive_police if isinstance(p.member, DummyMember)]
+        for police_p in bot_police:
+            possible_targets = [p for p in game.players.values() if p.is_alive and p.member.id != police_p.member.id]
+            if possible_targets:
+                investigate_target = random.choice(possible_targets)
+                game.police_investigation = investigate_target.member.id
+                game.night_actions_received += 1
+                is_mafia = investigate_target.role == Role.MAFIA
+                result_text = "IS MAFIA" if is_mafia else "NOT Mafia"
+                await send_game_message(game, content=f"🤖 *(Test Mode) Bot Police investigated **{investigate_target.name}** — {result_text}*")
     
-    # Process night results
-    await process_night_results(game)
+    await send_game_message(game, content=f"⏳ **Waiting for {game.night_actions_expected} night action(s)...**")
+    
+    # Poll every 30 seconds — remind players who haven't chosen yet
+    time_waited = 0
+    while game.phase == GamePhase.NIGHT and not game.night_auto_end_triggered:
+        if game.night_actions_received >= game.night_actions_expected:
+            game.night_auto_end_triggered = True
+            
+            if game.settings.test_mode:
+                await send_game_message(game, content=f"🤖 *(Test Mode) All {game.night_actions_received}/{game.night_actions_expected} night actions received*")
+            
+            await send_game_message(game, content="✅ **All night actions are in!** Processing results in 10 seconds...")
+            await asyncio.sleep(10)
+            
+            if game.phase == GamePhase.ENDED:
+                return
+            
+            await process_night_results(game)
+            return
+        
+        await asyncio.sleep(2)
+        time_waited += 2
+        
+        # Every 30 seconds, remind players who haven't submitted
+        if time_waited % 30 == 0 and time_waited > 0:
+            pending = game.night_actions_expected - game.night_actions_received
+            await send_game_message(game, content=f"⏳ **Still waiting for {pending} night action(s)...** Please check your DMs!")
+            
+            # DM reminder to players who haven't submitted
+            for player in game.players.values():
+                if not player.is_alive:
+                    continue
+                if player.member.id in game.night_actions_submitted:
+                    continue
+                if isinstance(player.member, DummyMember):
+                    continue
+                if player.role in (Role.MAFIA, Role.DOCTOR, Role.POLICE):
+                    try:
+                        await player.member.send(f"⏰ **Reminder:** Please make your night action choice! The game is waiting for you.")
+                    except:
+                        pass
 
 
 async def process_night_results(game: GameState):
     """Process the results of night actions"""
+    mafia_skipped = False
+    
     # Determine mafia target (majority vote among mafia)
     if game.mafia_votes:
         vote_counts = {}
@@ -1147,37 +1547,53 @@ async def process_night_results(game: GameState):
             vote_counts[target_id] = vote_counts.get(target_id, 0) + 1
         
         if vote_counts:
-            game.mafia_target = max(vote_counts, key=vote_counts.get)
+            top_vote = max(vote_counts, key=vote_counts.get)
+            if top_vote == -1:
+                # Mafia chose to skip
+                mafia_skipped = True
+                game.mafia_skips_used += 1
+                game.mafia_target = None
+                if game.settings.test_mode:
+                    await send_game_message(game, content="🤖 *(Test Mode) Mafia chose to skip their kill this round*")
+            else:
+                game.mafia_target = top_vote
     
     # Check if doctor saved the target
-    saved = game.mafia_target == game.doctor_save
+    saved = game.mafia_target is not None and game.mafia_target == game.doctor_save
+    if saved and game.settings.test_mode:
+        target = game.players[game.mafia_target]
+        await send_game_message(game, content=f"🤖 *(Test Mode) Doctor saved **{target.name}** from Mafia attack*")
     
     # Start day phase
-    await start_day_phase(game, saved)
+    await start_day_phase(game, saved, mafia_skipped)
 
 
-async def start_day_phase(game: GameState, was_saved: bool):
+async def start_day_phase(game: GameState, was_saved: bool, mafia_skipped: bool = False):
     """Start the day phase"""
+    # Check if game was force stopped
+    if game.phase == GamePhase.ENDED:
+        return
+    
     game.phase = GamePhase.DAY
     
     # Play "Night Is Over" announcement
     await play_announcement(game, "night_is_over")
     
-    # Unmute and undeafen ONLY alive players (dead stay deafened to not hear discussions)
+    # Unmute ONLY alive players (dead stay muted throughout the game)
     for player in game.players.values():
         if hasattr(player.member, 'voice') and player.member.voice:
             try:
                 if player.is_alive:
-                    await player.member.edit(mute=False, deafen=False)
+                    await player.member.edit(mute=False)
                 else:
-                    # Dead players stay muted and deafened
-                    await player.member.edit(mute=True, deafen=True)
+                    # Dead players stay muted
+                    await player.member.edit(mute=True)
             except discord.errors.Forbidden:
                 logger.warning(f"No permission to edit {player.name}")
             except Exception as e:
                 logger.warning(f"Failed to edit {player.name}: {e}")
     
-    # Play saved announcement if someone was saved
+    # Play saved announcement if someone was saved (but don't reveal who)
     if was_saved:
         await play_announcement(game, "someone_saved")
     
@@ -1191,9 +1607,10 @@ async def start_day_phase(game: GameState, was_saved: bool):
     if game.mafia_target:
         target = game.players[game.mafia_target]
         if was_saved:
+            # Doctor saved someone — don't reveal who, just say peaceful night
             embed.add_field(
-                name="🏥 Good News!",
-                value=f"The doctor saved **{target.name}** from the Mafia's attack!",
+                name="😴 Peaceful Night",
+                value="Everyone is safe! No one died during the night.",
                 inline=False
             )
         else:
@@ -1204,7 +1621,8 @@ async def start_day_phase(game: GameState, was_saved: bool):
                 inline=False
             )
     else:
-        embed.add_field(name="😴 Peaceful Night", value="No one was killed during the night.", inline=False)
+        # Mafia skipped or didn't vote — same generic message
+        embed.add_field(name="😴 Peaceful Night", value="Everyone is safe! No one died during the night.", inline=False)
     
     # Show alive players
     alive_players = [p.name for p in game.players.values() if p.is_alive]
@@ -1216,32 +1634,18 @@ async def start_day_phase(game: GameState, was_saved: bool):
     if await check_win_condition(game):
         return
     
-    # Discussion time with countdown updates
-    discussion_time = game.settings.discussion_time
-    await send_game_message(game, content=f"💬 **Discussion time!** You have **{format_time(discussion_time)}** to discuss.")
-    
-    # Countdown updates at specific intervals
-    countdown_points = [60, 30, 10, 5]
-    elapsed = 0
-    
-    for countdown in countdown_points:
-        if discussion_time > countdown:
-            wait_until = discussion_time - countdown
-            if wait_until > elapsed:
-                await asyncio.sleep(wait_until - elapsed)
-                elapsed = wait_until
-                await send_game_message(game, content=f"⏱️ **{countdown} seconds** remaining for discussion!")
-    
-    # Wait remaining time
-    if discussion_time > elapsed:
-        await asyncio.sleep(discussion_time - elapsed)
-    
-    # Start voting
-    await start_voting_phase(game)
+    # Discussion phase - no timer, host clicks button to start voting
+    discussion_view = DiscussionEndView(game, game.host_id)
+    await send_game_message(game, content="💬 **Discussion time!** Discuss among yourselves.\nHost: click **🗳️ Start Voting** when the discussion is over.", view=discussion_view)
+    # Voting will be started by the DiscussionEndView button callback
 
 
 async def start_voting_phase(game: GameState):
     """Start the voting phase"""
+    # Check if game was force stopped
+    if game.phase == GamePhase.ENDED:
+        return
+    
     game.phase = GamePhase.VOTING
     game.day_votes.clear()
     
@@ -1281,8 +1685,42 @@ async def start_voting_phase(game: GameState):
             if bot_votes:
                 await send_game_message(game, content=f"🤖 *[Test Mode] Bot votes:*\n" + "\n".join(bot_votes))
     
-    # Wait for voting
-    await asyncio.sleep(game.settings.voting_time + 5)
+    # Live countdown in text chat
+    voting_time = game.settings.voting_time
+    countdown_interval = 10  # Show countdown every 10 seconds
+    elapsed = 0
+    
+    while elapsed < voting_time:
+        # Check if game was force stopped
+        if game.phase == GamePhase.ENDED:
+            return
+        
+        remaining = voting_time - elapsed
+        
+        # Show countdown at specific intervals
+        if remaining > 0 and remaining <= voting_time:
+            if remaining == voting_time:
+                # First message
+                await send_game_message(game, content=f"⏱️ **{remaining}s** remaining to vote!")
+            elif remaining <= 10:
+                await send_game_message(game, content=f"⚠️ **{remaining}s** remaining!")
+            elif remaining % countdown_interval == 0:
+                bar = create_progress_bar(remaining, voting_time, 10)
+                await send_game_message(game, content=f"⏱️ {bar} **{remaining}s** remaining")
+        
+        # Wait for next tick
+        wait_time = min(countdown_interval, voting_time - elapsed)
+        if wait_time > 0:
+            await asyncio.sleep(wait_time)
+        elapsed += wait_time
+    
+    # Final message
+    await send_game_message(game, content="⏰ **Time's up!** Votes are being tallied...")
+    await asyncio.sleep(2)
+    
+    # Check if game was force stopped during voting
+    if game.phase == GamePhase.ENDED:
+        return
     
     # Process votes
     await process_voting_results(game)
@@ -1290,6 +1728,10 @@ async def start_voting_phase(game: GameState):
 
 async def process_voting_results(game: GameState):
     """Process voting results"""
+    # Check if game was force stopped
+    if game.phase == GamePhase.ENDED:
+        return
+    
     vote_counts: Dict[Optional[int], int] = {}  # target_id -> count (None = skip)
     
     alive_players = [p for p in game.players.values() if p.is_alive]
@@ -1330,29 +1772,112 @@ async def process_voting_results(game: GameState):
         # Check if skip has more votes
         if skip_votes > max_votes:
             embed.add_field(name="📢 Result", value="The vote was skipped! No one is eliminated.", inline=False)
+            await send_game_message(game, embed=embed)
         elif len(top_voted) == 1 and max_votes > skip_votes:
             eliminated_id = top_voted[0]
             eliminated = game.players[eliminated_id]
             eliminated.is_alive = False
-            embed.add_field(
-                name="💀 Eliminated",
-                value=f"**{eliminated.name}** has been eliminated!\nThey were a **{eliminated.role.value}**.",
-                inline=False
-            )
+            reveal_mode = game.settings.role_reveal_mode
+            
+            if reveal_mode == 1:
+                # Mode 1: No reveal at all
+                embed.add_field(
+                    name="💀 Eliminated",
+                    value=f"**{eliminated.name}** has been voted out!",
+                    inline=False
+                )
+                await send_game_message(game, embed=embed)
+            
+            elif reveal_mode == 2:
+                # Mode 2: Just say mafia or not
+                embed.add_field(
+                    name="💀 Eliminated",
+                    value=f"**{eliminated.name}** has been voted out!",
+                    inline=False
+                )
+                await send_game_message(game, embed=embed)
+                
+                await asyncio.sleep(2)
+                await send_game_message(game, content="🥁 *The town holds its breath...*")
+                await asyncio.sleep(2)
+                
+                if eliminated.role == Role.MAFIA:
+                    reveal_embed = discord.Embed(
+                        title="🔴 MAFIA CAUGHT!",
+                        description=f"**{eliminated.name}** was **Mafia**! 🎯",
+                        color=discord.Color.green()
+                    )
+                else:
+                    reveal_embed = discord.Embed(
+                        title="💔 Not Mafia...",
+                        description=f"**{eliminated.name}** was **not Mafia** 😔",
+                        color=discord.Color.red()
+                    )
+                await send_game_message(game, embed=reveal_embed)
+            
+            else:
+                # Mode 3: Full role reveal with suspense (default)
+                embed.add_field(
+                    name="💀 Eliminated",
+                    value=f"**{eliminated.name}** has been voted out!",
+                    inline=False
+                )
+                await send_game_message(game, embed=embed)
+                
+                # Count remaining mafia to check if this was the last mafia moment
+                alive_mafia_count = sum(1 for p in game.players.values() if p.is_alive and p.role == Role.MAFIA)
+                is_last_mafia_moment = (alive_mafia_count == 0 and eliminated.role == Role.MAFIA) or \
+                                       (alive_mafia_count == 1 and eliminated.role != Role.MAFIA) or \
+                                       (alive_mafia_count == 0)
+                
+                await asyncio.sleep(2)
+                await send_game_message(game, content="🥁 *The town holds its breath...*")
+                await asyncio.sleep(2)
+                
+                if is_last_mafia_moment:
+                    await send_game_message(game, content="😰 *Could this be the final Mafia member?*")
+                    await asyncio.sleep(2)
+                    await send_game_message(game, content="🫣 *Flipping the card...*")
+                    await asyncio.sleep(3)
+                else:
+                    await send_game_message(game, content="🫣 *Revealing their identity...*")
+                    await asyncio.sleep(2)
+                
+                if eliminated.role == Role.MAFIA:
+                    reveal_embed = discord.Embed(
+                        title="🔴 MAFIA CAUGHT!",
+                        description=f"**{eliminated.name}** was indeed **MAFIA**! 🎯\n\nThe town made the right call!",
+                        color=discord.Color.green()
+                    )
+                    reveal_embed.set_footer(text="✅ One less threat to the town.")
+                else:
+                    reveal_embed = discord.Embed(
+                        title="💔 An Innocent Falls...",
+                        description=f"**{eliminated.name}** was a **{eliminated.role.value}**... 😔\n\nThe town has made a terrible mistake!",
+                        color=discord.Color.red()
+                    )
+                    reveal_embed.set_footer(text="❌ The Mafia lives on...")
+                
+                await send_game_message(game, embed=reveal_embed)
         else:
             embed.add_field(name="📢 Result", value="It's a tie! No one is eliminated.", inline=False)
+            await send_game_message(game, embed=embed)
     else:
         embed.add_field(name="📢 Result", value="Everyone skipped! No one is eliminated.", inline=False)
-    
-    await send_game_message(game, embed=embed)
+        await send_game_message(game, embed=embed)
     
     # Check win conditions
     if await check_win_condition(game):
         return
     
-    # Start next night
-    await asyncio.sleep(3)
-    await start_night_phase(game)
+    # Check if game was force stopped
+    if game.phase == GamePhase.ENDED:
+        return
+    
+    # Show "Start Night" button for host (no auto-transition)
+    next_round_view = NextRoundView(game, game.host_id)
+    await send_game_message(game, content="🌙 **Ready for next round?** Host: click the button below to start the night.", view=next_round_view)
+    # Next night will be started by the NextRoundView button callback
 
 
 async def check_win_condition(game: GameState) -> bool:
@@ -1403,15 +1928,15 @@ async def end_game(game: GameState, embed: discord.Embed):
         
         final_message = await game.text_channel.send(embed=embed)
         
-        # Unmute and undeafen all players at game end
+        # Unmute all players at game end
         for player in game.players.values():
             if hasattr(player.member, 'voice') and player.member.voice:
                 try:
-                    await player.member.edit(mute=False, deafen=False)
+                    await player.member.edit(mute=False)
                 except discord.errors.Forbidden:
-                    logger.warning(f"No permission to unmute/undeafen {player.name}")
+                    logger.warning(f"No permission to unmute {player.name}")
                 except Exception as e:
-                    logger.warning(f"Failed to unmute/undeafen {player.name}: {e}")
+                    logger.warning(f"Failed to unmute {player.name}: {e}")
         
         # Disconnect from voice if connected
         if game.guild:
@@ -1766,7 +2291,6 @@ async def unlock_channel(ctx, channel: discord.VoiceChannel = None):
 # ==================== MAFIA GAME COMMANDS ====================
 
 @bot.command(name='mafia', help='Start a new Mafia game')
-@commands.has_permissions(administrator=True)
 async def start_mafia(ctx):
     """Start a new Mafia game in the current voice channel"""
     try:
@@ -1888,7 +2412,6 @@ async def test_mafia(ctx, num_players: int = 6):
         # Reduce timers for faster testing
         game.settings.voting_time = 20
         game.settings.discussion_time = 15
-        game.settings.night_action_time = 15
         
         # Add the tester as a real player
         tester_player = Player(member=ctx.author, name=ctx.author.display_name)
@@ -1914,7 +2437,7 @@ async def test_mafia(ctx, num_players: int = 6):
         player_list = "\n".join([f"• {p.name} {'(You)' if p.member.id == ctx.author.id else '(Bot)'}" for p in game.players.values()])
         embed.add_field(name=f"Players ({len(game.players)})", value=player_list, inline=False)
         embed.add_field(name="⚙️ Settings", value=f"Mafia: {game.settings.num_mafia} | Doctor: {game.settings.num_doctor} | Police: {game.settings.num_police}", inline=False)
-        embed.add_field(name="⏱️ Timers (Reduced)", value=f"Vote: {game.settings.voting_time}s | Discuss: {game.settings.discussion_time}s | Night: {game.settings.night_action_time}s", inline=False)
+        embed.add_field(name="⏱️ Timers (Reduced)", value=f"Vote: {game.settings.voting_time}s | Discuss: {game.settings.discussion_time}s", inline=False)
         
         msg = await ctx.send(embed=embed)
         game.game_messages.append(msg)
@@ -2149,7 +2672,6 @@ async def test_skip_phase(ctx):
     # Set all timers to 1 second for quick skip
     game.settings.voting_time = 1
     game.settings.discussion_time = 1
-    game.settings.night_action_time = 1
     
     msg = await ctx.send("⏩ Test: Timers reduced to 1 second. Phase will end shortly.")
     game.game_messages.append(msg)
@@ -2306,6 +2828,9 @@ async def end_current_game(ctx):
         await ctx.send("❌ No active game to end!")
         return
     
+    # IMMEDIATELY set phase to ENDED to stop all async game loops
+    game.phase = GamePhase.ENDED
+    
     # Track the command message
     game.game_messages.append(ctx.message)
     
@@ -2362,6 +2887,105 @@ async def end_current_game(ctx):
         del active_games[ctx.guild.id]
 
 
+@bot.command(name='forcestop', aliases=['haltgame', 'killgame'], help='Force stop ALL games and reset ALL voice states immediately')
+@commands.has_permissions(administrator=True)
+async def force_stop_all_games(ctx):
+    """
+    Emergency command to halt ALL games and reset ALL voice states immediately.
+    This command:
+    1. Immediately ends all active games in this server
+    2. Unmutes and undeafens ALL members in your current voice channel
+    3. Does NOT wait for cleanup - immediate action
+    """
+    logger.info(f"Force stop initiated by {ctx.author.display_name} in guild {ctx.guild.name}")
+    
+    # Get the game for this guild
+    game = get_game(ctx.guild.id)
+    
+    # Immediately mark game as ended to stop all async loops
+    if game:
+        game.phase = GamePhase.ENDED
+        logger.info(f"Game phase set to ENDED")
+    
+    # Remove from active games IMMEDIATELY
+    if ctx.guild.id in active_games:
+        del active_games[ctx.guild.id]
+        logger.info(f"Game removed from active_games")
+    
+    # Count of actions taken
+    unmuted_count = 0
+    errors = []
+    
+    # If user is in a voice channel, unmute ALL members in that channel
+    if ctx.author.voice and ctx.author.voice.channel:
+        channel = ctx.author.voice.channel
+        for member in channel.members:
+            if not member.bot:
+                try:
+                    needs_unmute = member.voice.mute if member.voice else False
+                    
+                    if needs_unmute:
+                        await member.edit(mute=False)
+                        unmuted_count += 1
+                        logger.info(f"Unmuted {member.display_name}")
+                except discord.errors.Forbidden:
+                    errors.append(f"No permission to edit {member.display_name}")
+                except Exception as e:
+                    errors.append(f"Failed to reset {member.display_name}: {str(e)}")
+    
+    # Also try to unmute game players who might have left the channel
+    if game and game.players:
+        for player in game.players.values():
+            if hasattr(player.member, 'voice') and player.member.voice:
+                try:
+                    needs_unmute = player.member.voice.mute if player.member.voice else False
+                    
+                    if needs_unmute:
+                        await player.member.edit(mute=False)
+                        unmuted_count += 1
+                except:
+                    pass
+    
+    # Disconnect bot from voice if connected
+    if ctx.voice_client:
+        try:
+            await ctx.voice_client.disconnect(force=True)
+        except:
+            pass
+    
+    # Also check if guild has a voice client (backup check)
+    if ctx.guild.voice_client:
+        try:
+            await ctx.guild.voice_client.disconnect(force=True)
+        except:
+            pass
+    
+    # Build response embed
+    embed = discord.Embed(
+        title="🛑 FORCE STOP - All Games Halted",
+        description="Emergency stop executed. All game processes terminated.",
+        color=discord.Color.dark_red()
+    )
+    
+    # Status summary
+    status_lines = []
+    status_lines.append(f"✅ Game ended: {'Yes' if game else 'No active game'}")
+    status_lines.append(f"🔊 Members unmuted: {unmuted_count}")
+    
+    embed.add_field(name="📊 Actions Taken", value="\n".join(status_lines), inline=False)
+    
+    if errors:
+        error_text = "\n".join(errors[:5])
+        if len(errors) > 5:
+            error_text += f"\n...and {len(errors) - 5} more"
+        embed.add_field(name="⚠️ Errors", value=error_text, inline=False)
+    
+    embed.set_footer(text="Use !mafia to start a new game")
+    
+    await ctx.send(embed=embed)
+    logger.info(f"Force stop completed: {unmuted_count} unmuted")
+
+
 @bot.command(name='gamesettings', help='View current game settings')
 async def view_settings(ctx):
     """View current game settings"""
@@ -2381,8 +3005,10 @@ async def view_settings(ctx):
     embed.add_field(name="🔍 Police Count", value=str(settings.num_police), inline=True)
     embed.add_field(name="🗳️ Voting Time", value=f"{settings.voting_time}s", inline=True)
     embed.add_field(name="💬 Discussion Time", value=f"{settings.discussion_time}s", inline=True)
-    embed.add_field(name="🌙 Night Action Time", value=f"{settings.night_action_time}s", inline=True)
     embed.add_field(name="📝 Registration Time", value=f"{settings.registration_time}s", inline=True)
+    embed.add_field(name="⏭️ Mafia Skip Kills", value=str(settings.mafia_skip_kills), inline=True)
+    reveal_labels = {1: "Hidden", 2: "Mafia/Not", 3: "Full Role"}
+    embed.add_field(name="👁️ Role Reveal", value=reveal_labels.get(settings.role_reveal_mode, "Full Role"), inline=True)
     
     await ctx.send(embed=embed)
 
@@ -2493,22 +3119,6 @@ async def set_discuss_time(ctx, seconds: int):
     await ctx.send(f"✅ Discussion time set to **{seconds}** seconds")
 
 
-@bot.command(name='setnighttime', help='Set night action time in seconds (15-120)')
-@commands.has_permissions(administrator=True)
-async def set_night_time(ctx, seconds: int):
-    """Set the night action time"""
-    if seconds < 15 or seconds > 120:
-        await ctx.send("❌ Night action time must be between 15 and 120 seconds!")
-        return
-    
-    game = get_game(ctx.guild.id)
-    if game:
-        game.settings.night_action_time = seconds
-    else:
-        game = create_game(ctx.guild.id)
-        game.settings.night_action_time = seconds
-    
-    await ctx.send(f"✅ Night action time set to **{seconds}** seconds")
 
 
 @bot.command(name='setregtime', help='Set registration time in seconds (30-300)')
@@ -2527,6 +3137,46 @@ async def set_reg_time(ctx, seconds: int):
         game.settings.registration_time = seconds
     
     await ctx.send(f"✅ Registration time set to **{seconds}** seconds")
+
+
+@bot.command(name='setskips', help='Set how many times mafia can skip killing (0-5)')
+@commands.has_permissions(administrator=True)
+async def set_skip_kills(ctx, count: int):
+    """Set the number of times mafia can skip killing per game"""
+    if count < 0 or count > 5:
+        await ctx.send("❌ Mafia skip kills must be between 0 and 5!")
+        return
+    
+    game = get_game(ctx.guild.id)
+    if game:
+        game.settings.mafia_skip_kills = count
+    else:
+        game = create_game(ctx.guild.id)
+        game.settings.mafia_skip_kills = count
+    
+    await ctx.send(f"✅ Mafia can now skip killing **{count}** time(s) per game")
+
+
+@bot.command(name='setreveal', help='Set role reveal mode (1=hidden, 2=mafia/not, 3=full role)')
+@commands.has_permissions(administrator=True)
+async def set_reveal_mode(ctx, mode: int):
+    """Set the role reveal mode on elimination"""
+    if mode not in (1, 2, 3):
+        await ctx.send("❌ Reveal mode must be 1, 2, or 3!\n"
+                       "**1** = No reveal (just voted out)\n"
+                       "**2** = Mafia or Not Mafia\n"
+                       "**3** = Full role with suspense")
+        return
+    
+    game = get_game(ctx.guild.id)
+    if game:
+        game.settings.role_reveal_mode = mode
+    else:
+        game = create_game(ctx.guild.id)
+        game.settings.role_reveal_mode = mode
+    
+    labels = {1: "Hidden (no reveal)", 2: "Mafia or Not Mafia", 3: "Full role with suspense"}
+    await ctx.send(f"✅ Role reveal mode set to **{mode}** — {labels[mode]}")
 
 
 @bot.command(name='gamestatus', help='Check current game status')
@@ -2571,6 +3221,7 @@ async def mafia_help(ctx):
             "`!mafia` - Start a new game (opens registration)\n"
             "`!startgame` - Force start game after registration\n"
             "`!endgame` - End current game\n"
+            "`!forcestop` - **Emergency:** Halt all games & reset voice states\n"
             "`!gamestatus` - Check game status"
         ),
         inline=False
@@ -2594,8 +3245,9 @@ async def mafia_help(ctx):
             "`!setpolice <0-3>` - Set number of police\n"
             "`!setvotetime <30-300>` - Set voting time (seconds)\n"
             "`!setdiscusstime <30-600>` - Set discussion time\n"
-            "`!setnighttime <15-120>` - Set night action time\n"
-            "`!setregtime <30-300>` - Set registration time"
+            "`!setregtime <30-300>` - Set registration time\n"
+            "`!setskips <0-5>` - Set mafia skip kills per game\n"
+            "`!setreveal <1-3>` - Role reveal (1=hidden, 2=mafia/not, 3=full)"
         ),
         inline=False
     )
