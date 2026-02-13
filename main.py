@@ -139,6 +139,9 @@ class GameState:
     # Mafia skip tracking
     mafia_skips_used: int = 0  # How many times mafia has skipped killing
     
+    # Discussion tracking
+    discussion_ended: bool = False  # Prevent double-triggering of voting start
+    
     # Day voting
     day_votes: Dict[int, Optional[int]] = field(default_factory=dict)  # voter_id -> target_id (None = skip)
     
@@ -1232,16 +1235,56 @@ class NightEndView(ui.View):
 
 
 class DiscussionEndView(ui.View):
-    """Button for host/admin to end discussion and start voting"""
-    def __init__(self, game: GameState, host_id: int):
+    """Button for host/admin to end discussion, with auto-timer fallback"""
+    def __init__(self, game: GameState, host_id: int, discussion_time: int):
         super().__init__(timeout=None)
         self.game = game
         self.host_id = host_id
+        self.discussion_time = discussion_time
+        self.discussion_message: Optional[discord.Message] = None
+    
+    async def start_timer(self):
+        """Background countdown that auto-starts voting when time runs out"""
+        elapsed = 0
+        while elapsed < self.discussion_time:
+            if self.game.discussion_ended or self.game.phase != GamePhase.DAY:
+                return
+            await asyncio.sleep(1)
+            elapsed += 1
+            # Update countdown every 30 seconds
+            remaining = self.discussion_time - elapsed
+            if remaining > 0 and remaining % 30 == 0 and self.discussion_message:
+                try:
+                    await self.discussion_message.edit(
+                        content=f"💬 **Discussion time!** ⏱️ **{format_time(remaining)}** remaining\nHost can also click **🗳️ Start Voting** to skip."
+                    )
+                except:
+                    pass
+            # Warning at 10 seconds
+            if remaining == 10 and self.discussion_message:
+                try:
+                    await self.discussion_message.edit(
+                        content=f"💬 **Discussion time!** ⏱️ **10s** remaining — voting starts soon!"
+                    )
+                except:
+                    pass
+        
+        # Timer expired — auto-start voting
+        if not self.game.discussion_ended and self.game.phase == GamePhase.DAY:
+            self.game.discussion_ended = True
+            for item in self.children:
+                item.disabled = True
+            if self.discussion_message:
+                try:
+                    await self.discussion_message.edit(content="⏰ **Discussion time is over!**", view=self)
+                except:
+                    pass
+            logger.info("Discussion ended by timer")
+            await start_voting_phase(self.game)
     
     @ui.button(label="🗳️ Start Voting", style=discord.ButtonStyle.danger, custom_id="start_voting_phase")
     async def start_voting_button(self, interaction: discord.Interaction, button: ui.Button):
         try:
-            # Only host or admin can click
             is_host = interaction.user.id == self.host_id
             is_admin = interaction.user.guild_permissions.administrator
             
@@ -1249,18 +1292,16 @@ class DiscussionEndView(ui.View):
                 await interaction.response.send_message("❌ Only the host or admin can start voting!", ephemeral=True)
                 return
             
-            if self.game.phase != GamePhase.DAY:
-                await interaction.response.send_message("❌ It's not discussion time!", ephemeral=True)
+            if self.game.phase != GamePhase.DAY or self.game.discussion_ended:
+                await interaction.response.send_message("❌ Voting has already started!", ephemeral=True)
                 return
             
-            # Disable the button
+            self.game.discussion_ended = True
             button.disabled = True
             button.label = "🗳️ Voting Started"
             await interaction.response.edit_message(view=self)
             
             logger.info(f"Voting started manually by {interaction.user.display_name}")
-            
-            # Start voting phase
             await start_voting_phase(self.game)
         except Exception as e:
             logger.error(f"Error in start_voting_button: {e}")
@@ -1732,10 +1773,17 @@ async def start_day_phase(game: GameState, was_saved: bool, mafia_skipped: bool 
     if await check_win_condition(game):
         return
     
-    # Discussion phase - no timer, host clicks button to start voting
-    discussion_view = DiscussionEndView(game, game.host_id)
-    await send_game_message(game, content="💬 **Discussion time!** Discuss among yourselves.\nHost: click **🗳️ Start Voting** when the discussion is over.", view=discussion_view)
-    # Voting will be started by the DiscussionEndView button callback
+    # Discussion phase - timer + manual button
+    game.discussion_ended = False
+    disc_time = game.settings.discussion_time
+    discussion_view = DiscussionEndView(game, game.host_id, disc_time)
+    disc_msg = await send_game_message(
+        game,
+        content=f"💬 **Discussion time!** ⏱️ **{format_time(disc_time)}** remaining\nHost can also click **🗳️ Start Voting** to skip.",
+        view=discussion_view
+    )
+    discussion_view.discussion_message = disc_msg
+    asyncio.create_task(discussion_view.start_timer())
 
 
 async def start_voting_phase(game: GameState):
